@@ -76,6 +76,15 @@ const Shell: React.FC = () => {
     }
   }, [leaveRoom, roomId, signOut]);
 
+  const messageOf = (err: unknown, fallback: string): string => {
+    if (err instanceof Error) return err.message;
+    if (err && typeof err === "object" && "message" in err) {
+      const m = err.message;
+      if (typeof m === "string") return m;
+    }
+    return fallback;
+  };
+
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -86,7 +95,7 @@ const Shell: React.FC = () => {
       setNewSlug("");
       setNewName("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "create failed");
+      setError(messageOf(err, "create failed"));
     }
   };
 
@@ -97,7 +106,7 @@ const Shell: React.FC = () => {
       await joinRoom(id);
       await refresh();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "join failed");
+      setError(messageOf(err, "join failed"));
     }
   };
 

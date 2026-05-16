@@ -42,3 +42,4 @@ supabase/.branches/
 # vercel
 .vercel/
 client/tsconfig.tsbuildinfo
+coverage/
