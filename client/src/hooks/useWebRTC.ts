@@ -325,7 +325,15 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
       await loadChatHistory(room);
       await startCallSession(room);
 
-      const channel = supabase.channel(`room:${room}`, {
+      const topic = `room:${room}`;
+      // Defensive: kill any stale channel for this topic (StrictMode / re-join races).
+      for (const existing of supabase.getChannels()) {
+        if (existing.topic === `realtime:${topic}` || existing.topic === topic) {
+          await supabase.removeChannel(existing);
+        }
+      }
+
+      const channel = supabase.channel(topic, {
         config: { presence: { key: userId } },
       });
       channelRef.current = channel;
@@ -403,7 +411,7 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
   const leaveRoom = useCallback(async () => {
     await endCallSession();
     if (channelRef.current) {
-      await channelRef.current.unsubscribe();
+      await supabase.removeChannel(channelRef.current);
       channelRef.current = null;
     }
     peersRef.current.forEach((state) => state.pc.close());
@@ -417,7 +425,7 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
   useEffect(() => {
     return () => {
       void endCallSession();
-      channelRef.current?.unsubscribe();
+      if (channelRef.current) void supabase.removeChannel(channelRef.current);
       peersRef.current.forEach((s) => s.pc.close());
       localStreamRef.current?.getTracks().forEach((t) => t.stop());
     };
