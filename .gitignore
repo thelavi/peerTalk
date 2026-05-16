@@ -33,3 +33,12 @@ coverage/
 
 # editor / tool-local
 .claude/
+
+# supabase CLI local artifacts
+supabase/.temp/
+supabase/.branches/
+**/supabase/.temp/
+
+# vercel
+.vercel/
+client/tsconfig.tsbuildinfo

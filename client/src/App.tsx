@@ -1,5 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
-import { useWebRTC } from "./hooks";
+import { useWebRTC } from "./hooks/useWebRTC";
+import { useAuth } from "./hooks/useAuth";
+import { useRooms } from "./hooks/useRooms";
+import { AuthGate } from "./components/AuthGate";
+import { CallHistory } from "./components/CallHistory";
 import "./App.css";
 
 const RemoteVideo: React.FC<{ stream: MediaStream; peerId: string }> = ({
@@ -20,9 +24,10 @@ const RemoteVideo: React.FC<{ stream: MediaStream; peerId: string }> = ({
   );
 };
 
-const App: React.FC = () => {
+const Shell: React.FC = () => {
+  const { user, signOut } = useAuth();
+  const userId = user?.id ?? null;
   const {
-    myId,
     roomId,
     peers,
     localStream,
@@ -37,11 +42,14 @@ const App: React.FC = () => {
     toggleCam,
     toggleScreenShare,
     sendChat,
-  } = useWebRTC();
+  } = useWebRTC({ userId });
+  const { rooms, createRoom, joinRoomMembership, refresh } = useRooms(userId);
 
   const localRef = useRef<HTMLVideoElement>(null);
-  const [roomInput, setRoomInput] = useState("");
+  const [newSlug, setNewSlug] = useState("");
+  const [newName, setNewName] = useState("");
   const [chatInput, setChatInput] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (localRef.current && localStream) localRef.current.srcObject = localStream;
@@ -49,34 +57,98 @@ const App: React.FC = () => {
 
   const inCall = Boolean(roomId);
 
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    try {
+      const room = await createRoom(newSlug, newName);
+      await joinRoomMembership(room.id);
+      await joinRoom(room.id);
+      setNewSlug("");
+      setNewName("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "create failed");
+    }
+  };
+
+  const handleJoin = async (id: string) => {
+    setError(null);
+    try {
+      await joinRoomMembership(id);
+      await joinRoom(id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "join failed");
+    }
+  };
+
   return (
     <div className="app">
       <header className="app__header">
         <h1>peerTalk</h1>
         <div className="muted">
-          you: <code>{myId.slice(0, 6) || "…"}</code>
+          <code>{user?.email}</code>
           {roomId && (
             <>
-              {" "}
-              · room: <code>{roomId}</code> · {peers.length + 1} peer(s)
+              {" · room "}
+              <code>{roomId.slice(0, 8)}</code>
+              {" · "}
+              {peers.length + 1} peer(s)
             </>
           )}
+          <button className="link" type="button" onClick={signOut}>
+            sign out
+          </button>
         </div>
       </header>
 
       {!inCall && (
         <section className="lobby">
-          <input
-            value={roomInput}
-            onChange={(e) => setRoomInput(e.target.value)}
-            placeholder="room id (e.g. demo)"
-          />
-          <button
-            disabled={!roomInput.trim()}
-            onClick={() => joinRoom(roomInput.trim())}
-          >
-            Join room
-          </button>
+          <div>
+            <h2>Create a room</h2>
+            <form className="lobby__create" onSubmit={handleCreate}>
+              <input
+                value={newSlug}
+                onChange={(e) => setNewSlug(e.target.value)}
+                placeholder="slug (e.g. demo)"
+                required
+              />
+              <input
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="display name (optional)"
+              />
+              <button type="submit" disabled={!newSlug.trim()}>
+                Create + join
+              </button>
+            </form>
+            {error && <p className="error">{error}</p>}
+          </div>
+
+          <div>
+            <h2>Available rooms</h2>
+            {rooms.length === 0 && (
+              <p className="muted">no rooms yet — create one above</p>
+            )}
+            <ul className="rooms">
+              {rooms.map((r) => (
+                <li key={r.id}>
+                  <div>
+                    <strong>{r.name}</strong>
+                    <code>{r.slug}</code>
+                  </div>
+                  <button onClick={() => handleJoin(r.id)}>Join</button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {userId && (
+            <div>
+              <h2>Recent calls</h2>
+              <CallHistory userId={userId} />
+            </div>
+          )}
         </section>
       )}
 
@@ -114,7 +186,7 @@ const App: React.FC = () => {
               {messages.map((m) => (
                 <div key={m.id} className="chat__msg">
                   <strong>
-                    {m.from === myId ? "you" : m.from.slice(0, 6)}
+                    {m.from === userId ? "you" : m.from.slice(0, 6)}
                   </strong>
                   : {m.text}
                 </div>
@@ -124,7 +196,7 @@ const App: React.FC = () => {
               className="chat__form"
               onSubmit={(e) => {
                 e.preventDefault();
-                sendChat(chatInput);
+                void sendChat(chatInput);
                 setChatInput("");
               }}
             >
@@ -143,5 +215,11 @@ const App: React.FC = () => {
     </div>
   );
 };
+
+const App: React.FC = () => (
+  <AuthGate>
+    <Shell />
+  </AuthGate>
+);
 
 export default App;

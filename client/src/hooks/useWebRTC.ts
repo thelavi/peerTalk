@@ -1,18 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import io, { Socket } from "socket.io-client";
-import type { ChatMessage, RemoteStreams, SignalData } from "../types";
-
-const SIGNALING_URL =
-  process.env.REACT_APP_SIGNALING_URL ?? "http://localhost:5001";
+import type { RealtimeChannel } from "@supabase/supabase-js";
+import { supabase } from "../lib/supabase";
+import type {
+  ChatMessage,
+  RemoteStreams,
+  SignalData,
+  SignalPayload,
+} from "../types";
 
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
-  ...(process.env.REACT_APP_TURN_URL
+  ...(import.meta.env.VITE_TURN_URL
     ? [
         {
-          urls: process.env.REACT_APP_TURN_URL,
-          username: process.env.REACT_APP_TURN_USER,
-          credential: process.env.REACT_APP_TURN_CRED,
+          urls: import.meta.env.VITE_TURN_URL,
+          username: import.meta.env.VITE_TURN_USER,
+          credential: import.meta.env.VITE_TURN_CRED,
         } as RTCIceServer,
       ]
     : []),
@@ -26,8 +29,11 @@ type PeerState = {
   dataChannel?: RTCDataChannel;
 };
 
+type UseWebRTCArgs = {
+  userId: string | null;
+};
+
 type UseWebRTCReturn = {
-  myId: string;
   roomId: string | null;
   peers: string[];
   localStream: MediaStream | null;
@@ -37,21 +43,22 @@ type UseWebRTCReturn = {
   camOn: boolean;
   screenSharing: boolean;
   joinRoom: (roomId: string) => Promise<void>;
-  leaveRoom: () => void;
+  leaveRoom: () => Promise<void>;
   toggleMic: () => void;
   toggleCam: () => void;
   toggleScreenShare: () => Promise<void>;
-  sendChat: (text: string) => void;
+  sendChat: (text: string) => Promise<void>;
 };
 
-export function useWebRTC(): UseWebRTCReturn {
-  const socketRef = useRef<Socket | null>(null);
+export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
+  const channelRef = useRef<RealtimeChannel | null>(null);
   const peersRef = useRef<Map<string, PeerState>>(new Map());
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenTrackRef = useRef<MediaStreamTrack | null>(null);
   const camTrackRef = useRef<MediaStreamTrack | null>(null);
+  const callIdRef = useRef<string | null>(null);
+  const callJoinedAtRef = useRef<number>(0);
 
-  const [myId, setMyId] = useState("");
   const [roomId, setRoomId] = useState<string | null>(null);
   const [peers, setPeers] = useState<string[]>([]);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -62,19 +69,6 @@ export function useWebRTC(): UseWebRTCReturn {
   const [screenSharing, setScreenSharing] = useState(false);
 
   // ---- helpers ----------------------------------------------------------
-
-  const upsertPeer = useCallback((peerId: string): string[] => {
-    let next: string[] = [];
-    setPeers((curr) => {
-      if (curr.includes(peerId)) {
-        next = curr;
-        return curr;
-      }
-      next = [...curr, peerId];
-      return next;
-    });
-    return next;
-  }, []);
 
   const removePeer = useCallback((peerId: string) => {
     const state = peersRef.current.get(peerId);
@@ -109,20 +103,31 @@ export function useWebRTC(): UseWebRTCReturn {
             },
           ]);
         } catch {
-          // swallow malformed
+          // ignore malformed
         }
       };
     },
     []
   );
 
+  const sendSignal = useCallback((to: string, data: SignalData) => {
+    if (!channelRef.current || !userId) return;
+    const payload: SignalPayload = { to, from: userId, data };
+    channelRef.current.send({
+      type: "broadcast",
+      event: "signal",
+      payload,
+    });
+  }, [userId]);
+
   const createPeer = useCallback(
     (peerId: string, initiator: boolean): PeerState => {
       const existing = peersRef.current.get(peerId);
       if (existing) return existing;
+      if (!userId) throw new Error("createPeer: userId required");
 
       const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-      const polite = (socketRef.current?.id ?? "") < peerId;
+      const polite = userId < peerId;
 
       const state: PeerState = {
         pc,
@@ -131,6 +136,7 @@ export function useWebRTC(): UseWebRTCReturn {
         ignoreOffer: false,
       };
       peersRef.current.set(peerId, state);
+      setPeers((curr) => (curr.includes(peerId) ? curr : [...curr, peerId]));
 
       localStreamRef.current?.getTracks().forEach((track) => {
         pc.addTrack(track, localStreamRef.current!);
@@ -140,10 +146,9 @@ export function useWebRTC(): UseWebRTCReturn {
         try {
           state.makingOffer = true;
           await pc.setLocalDescription();
-          socketRef.current?.emit("signal", {
-            to: peerId,
-            data: { description: pc.localDescription },
-          });
+          if (pc.localDescription) {
+            sendSignal(peerId, { description: pc.localDescription });
+          }
         } catch (err) {
           console.error("[onnegotiationneeded]", err);
         } finally {
@@ -152,10 +157,7 @@ export function useWebRTC(): UseWebRTCReturn {
       };
 
       pc.onicecandidate = ({ candidate }) => {
-        socketRef.current?.emit("signal", {
-          to: peerId,
-          data: { candidate },
-        });
+        sendSignal(peerId, { candidate });
       };
 
       pc.ontrack = ({ streams: [stream] }) => {
@@ -180,7 +182,7 @@ export function useWebRTC(): UseWebRTCReturn {
 
       return state;
     },
-    [attachDataChannel, removePeer]
+    [attachDataChannel, removePeer, sendSignal, userId]
   );
 
   const handleDescription = useCallback(
@@ -198,13 +200,12 @@ export function useWebRTC(): UseWebRTCReturn {
       await pc.setRemoteDescription(description);
       if (description.type === "offer") {
         await pc.setLocalDescription();
-        socketRef.current?.emit("signal", {
-          to: from,
-          data: { description: pc.localDescription },
-        });
+        if (pc.localDescription) {
+          sendSignal(from, { description: pc.localDescription });
+        }
       }
     },
-    []
+    [sendSignal]
   );
 
   const handleCandidate = useCallback(
@@ -234,44 +235,7 @@ export function useWebRTC(): UseWebRTCReturn {
     [createPeer, handleDescription, handleCandidate]
   );
 
-  // ---- socket lifecycle -------------------------------------------------
-
-  useEffect(() => {
-    const socket = io(SIGNALING_URL, { autoConnect: true });
-    socketRef.current = socket;
-
-    socket.on("connect", () => setMyId(socket.id ?? ""));
-
-    socket.on("room-peers", ({ peers: existing }: { peers: string[] }) => {
-      existing.forEach((peerId) => {
-        upsertPeer(peerId);
-        createPeer(peerId, true);
-      });
-    });
-
-    socket.on("peer-joined", ({ peerId }: { peerId: string }) => {
-      upsertPeer(peerId);
-    });
-
-    socket.on("peer-left", ({ peerId }: { peerId: string }) => {
-      removePeer(peerId);
-    });
-
-    socket.on(
-      "signal",
-      ({ from, data }: { from: string; data: SignalData }) => {
-        handleSignal(from, data);
-      }
-    );
-
-    return () => {
-      peersRef.current.forEach((state) => state.pc.close());
-      peersRef.current.clear();
-      socket.disconnect();
-    };
-  }, [createPeer, handleSignal, removePeer, upsertPeer]);
-
-  // ---- actions ----------------------------------------------------------
+  // ---- media helpers ----------------------------------------------------
 
   const ensureLocalStream = useCallback(async (): Promise<MediaStream> => {
     if (localStreamRef.current) return localStreamRef.current;
@@ -285,23 +249,181 @@ export function useWebRTC(): UseWebRTCReturn {
     return stream;
   }, []);
 
-  const joinRoom = useCallback(
+  // ---- chat persistence -------------------------------------------------
+
+  const loadChatHistory = useCallback(async (room: string) => {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("id, sender_id, body, created_at")
+      .eq("room_id", room)
+      .is("deleted_at", null)
+      .order("created_at", { ascending: true })
+      .limit(100);
+    if (error) {
+      console.error("[loadChatHistory]", error);
+      return;
+    }
+    setMessages(
+      data.map((row) => ({
+        id: row.id,
+        from: row.sender_id,
+        text: row.body,
+        ts: new Date(row.created_at).getTime(),
+        fromDB: true,
+      }))
+    );
+  }, []);
+
+  // ---- call history -----------------------------------------------------
+
+  const startCallSession = useCallback(
     async (room: string) => {
-      await ensureLocalStream();
-      setRoomId(room);
-      socketRef.current?.emit("join-room", { roomId: room });
+      if (!userId) return;
+      const { data, error } = await supabase
+        .from("call_sessions")
+        .insert({ room_id: room, initiator_id: userId })
+        .select("id")
+        .single();
+      if (error) {
+        console.error("[startCallSession]", error);
+        return;
+      }
+      callIdRef.current = data.id;
+      callJoinedAtRef.current = Date.now();
+      await supabase
+        .from("call_participants")
+        .insert({ call_id: data.id, user_id: userId });
     },
-    [ensureLocalStream]
+    [userId]
   );
 
-  const leaveRoom = useCallback(() => {
-    if (roomId) socketRef.current?.emit("leave-room", { roomId });
+  const endCallSession = useCallback(async () => {
+    if (!callIdRef.current || !userId) return;
+    const callId = callIdRef.current;
+    const durationSeconds = Math.round(
+      (Date.now() - callJoinedAtRef.current) / 1000
+    );
+    await supabase
+      .from("call_participants")
+      .update({ left_at: new Date().toISOString(), duration_seconds: durationSeconds })
+      .eq("call_id", callId)
+      .eq("user_id", userId);
+    await supabase
+      .from("call_sessions")
+      .update({ ended_at: new Date().toISOString() })
+      .eq("id", callId)
+      .is("ended_at", null);
+    callIdRef.current = null;
+  }, [userId]);
+
+  // ---- room lifecycle ---------------------------------------------------
+
+  const joinRoom = useCallback(
+    async (room: string) => {
+      if (!userId) throw new Error("not authenticated");
+      await ensureLocalStream();
+      await loadChatHistory(room);
+      await startCallSession(room);
+
+      const channel = supabase.channel(`room:${room}`, {
+        config: { presence: { key: userId } },
+      });
+      channelRef.current = channel;
+
+      channel.on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const present = Object.keys(state).filter((id) => id !== userId);
+        present.forEach((peerId) => {
+          if (!peersRef.current.has(peerId)) {
+            createPeer(peerId, userId < peerId);
+          }
+        });
+        peersRef.current.forEach((_, peerId) => {
+          if (!present.includes(peerId)) removePeer(peerId);
+        });
+      });
+
+      channel.on("broadcast", { event: "signal" }, ({ payload }) => {
+        const sig = payload as SignalPayload;
+        if (sig.to !== userId) return;
+        handleSignal(sig.from, sig.data);
+      });
+
+      channel.on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `room_id=eq.${room}`,
+        },
+        (change) => {
+          const row = change.new as {
+            id: string;
+            sender_id: string;
+            body: string;
+            created_at: string;
+          };
+          if (row.sender_id === userId) return;
+          setMessages((curr) => {
+            if (curr.some((m) => m.id === row.id)) return curr;
+            return [
+              ...curr,
+              {
+                id: row.id,
+                from: row.sender_id,
+                text: row.body,
+                ts: new Date(row.created_at).getTime(),
+                fromDB: true,
+              },
+            ];
+          });
+        }
+      );
+
+      channel.subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          void channel.track({ online_at: new Date().toISOString() });
+        }
+      });
+
+      setRoomId(room);
+    },
+    [
+      createPeer,
+      ensureLocalStream,
+      handleSignal,
+      loadChatHistory,
+      removePeer,
+      startCallSession,
+      userId,
+    ]
+  );
+
+  const leaveRoom = useCallback(async () => {
+    await endCallSession();
+    if (channelRef.current) {
+      await channelRef.current.unsubscribe();
+      channelRef.current = null;
+    }
     peersRef.current.forEach((state) => state.pc.close());
     peersRef.current.clear();
     setPeers([]);
     setRemoteStreams({});
+    setMessages([]);
     setRoomId(null);
-  }, [roomId]);
+  }, [endCallSession]);
+
+  useEffect(() => {
+    return () => {
+      void endCallSession();
+      channelRef.current?.unsubscribe();
+      peersRef.current.forEach((s) => s.pc.close());
+      localStreamRef.current?.getTracks().forEach((t) => t.stop());
+    };
+  }, [endCallSession]);
+
+  // ---- media controls ---------------------------------------------------
 
   const toggleMic = useCallback(() => {
     const track = localStreamRef.current?.getAudioTracks()[0];
@@ -317,17 +439,14 @@ export function useWebRTC(): UseWebRTCReturn {
     setCamOn(track.enabled);
   }, []);
 
-  const replaceVideoTrackOnPeers = useCallback(
-    (newTrack: MediaStreamTrack) => {
-      peersRef.current.forEach((state) => {
-        const sender = state.pc
-          .getSenders()
-          .find((s) => s.track?.kind === "video");
-        sender?.replaceTrack(newTrack);
-      });
-    },
-    []
-  );
+  const replaceVideoTrackOnPeers = useCallback((newTrack: MediaStreamTrack) => {
+    peersRef.current.forEach((state) => {
+      const sender = state.pc
+        .getSenders()
+        .find((s) => s.track?.kind === "video");
+      sender?.replaceTrack(newTrack);
+    });
+  }, []);
 
   const toggleScreenShare = useCallback(async () => {
     if (screenSharing) {
@@ -338,9 +457,7 @@ export function useWebRTC(): UseWebRTCReturn {
       setScreenSharing(false);
       return;
     }
-    const display = await navigator.mediaDevices.getDisplayMedia({
-      video: true,
-    });
+    const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
     const track = display.getVideoTracks()[0];
     screenTrackRef.current = track;
     replaceVideoTrackOnPeers(track);
@@ -353,26 +470,36 @@ export function useWebRTC(): UseWebRTCReturn {
     setScreenSharing(true);
   }, [replaceVideoTrackOnPeers, screenSharing]);
 
+  // ---- chat send (DC fast path + DB durable) ----------------------------
+
   const sendChat = useCallback(
-    (text: string) => {
-      if (!text.trim()) return;
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || !userId || !roomId) return;
       const ts = Date.now();
-      const payload = JSON.stringify({ text, ts });
+      const tempId = `${userId}-${ts}`;
+
+      // 1. optimistic local
+      setMessages((m) => [...m, { id: tempId, from: userId, text: trimmed, ts }]);
+
+      // 2. DataChannel push to online peers
+      const dcPayload = JSON.stringify({ text: trimmed, ts });
       peersRef.current.forEach((state) => {
         if (state.dataChannel?.readyState === "open") {
-          state.dataChannel.send(payload);
+          state.dataChannel.send(dcPayload);
         }
       });
-      setMessages((m) => [
-        ...m,
-        { id: `${myId}-${ts}`, from: myId, text, ts },
-      ]);
+
+      // 3. DB persist (also triggers postgres_changes for offline peers)
+      const { error } = await supabase
+        .from("messages")
+        .insert({ room_id: roomId, sender_id: userId, body: trimmed });
+      if (error) console.error("[sendChat persist]", error);
     },
-    [myId]
+    [roomId, userId]
   );
 
   return {
-    myId,
     roomId,
     peers,
     localStream,
