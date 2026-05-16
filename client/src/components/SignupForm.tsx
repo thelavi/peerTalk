@@ -24,7 +24,17 @@ export const SignupForm: React.FC = () => {
     try {
       await signUp(email, password, username.toLowerCase());
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Signup failed");
+      const raw = err instanceof Error ? err.message : "Signup failed";
+      // Surface known conflicts in plain language. The trigger inserts a
+      // profiles row inside the same transaction as auth.users; a username
+      // collision bubbles up as Postgres code 23505 (unique_violation).
+      let friendly = raw;
+      if (/already registered|already exists/i.test(raw)) {
+        friendly = "Email already registered — try signing in.";
+      } else if (/23505|profiles_username_key/.test(raw)) {
+        friendly = "Username already taken — pick another.";
+      }
+      setError(friendly);
     } finally {
       setBusy(false);
     }

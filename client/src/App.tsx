@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useWebRTC } from "./hooks/useWebRTC";
 import { useAuth } from "./hooks/useAuth";
 import { useRooms } from "./hooks/useRooms";
@@ -49,14 +49,32 @@ const Shell: React.FC = () => {
   const [newName, setNewName] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const chatLogRef = useRef<HTMLDivElement>(null);
 
-  const attachLocal = (el: HTMLVideoElement | null) => {
-    if (el && localStream && el.srcObject !== localStream) {
-      el.srcObject = localStream;
-    }
-  };
+  const attachLocal = useCallback(
+    (el: HTMLVideoElement | null) => {
+      if (el && localStream && el.srcObject !== localStream) {
+        el.srcObject = localStream;
+      }
+    },
+    [localStream]
+  );
+
+  // auto-scroll chat to bottom on new message
+  useEffect(() => {
+    const el = chatLogRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages]);
 
   const inCall = Boolean(roomId);
+
+  const handleSignOut = useCallback(async () => {
+    try {
+      if (roomId) await leaveRoom();
+    } finally {
+      await signOut();
+    }
+  }, [leaveRoom, roomId, signOut]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -97,7 +115,7 @@ const Shell: React.FC = () => {
               {peers.length + 1} peer(s)
             </>
           )}
-          <button className="link" type="button" onClick={signOut}>
+          <button className="link" type="button" onClick={handleSignOut}>
             sign out
           </button>
         </div>
@@ -180,7 +198,7 @@ const Shell: React.FC = () => {
 
           <aside className="chat">
             <h3>chat</h3>
-            <div className="chat__log">
+            <div className="chat__log" ref={chatLogRef}>
               {messages.length === 0 && (
                 <p className="muted">no messages yet</p>
               )}

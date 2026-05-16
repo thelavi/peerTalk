@@ -4,6 +4,7 @@ import type { Database } from "../types/database";
 
 export type Room = Database["public"]["Tables"]["rooms"]["Row"];
 
+// Mirror server check constraint `^[a-z0-9-]{3,40}$` exactly — no /i flag.
 const SLUG_RE = /^[a-z0-9-]{3,40}$/;
 
 export function useRooms(userId: string | null) {

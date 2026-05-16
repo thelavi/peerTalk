@@ -8,18 +8,21 @@ import type {
   SignalPayload,
 } from "../types";
 
-const ICE_SERVERS: RTCIceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  ...(import.meta.env.VITE_TURN_URL
-    ? [
-        {
-          urls: import.meta.env.VITE_TURN_URL,
-          username: import.meta.env.VITE_TURN_USER,
-          credential: import.meta.env.VITE_TURN_CRED,
-        } as RTCIceServer,
-      ]
-    : []),
-];
+const MAX_CHAT_BYTES = 8 * 1024; // 8 KB ceiling for DataChannel chat payloads
+
+function buildIceServers(): RTCIceServer[] {
+  const servers: RTCIceServer[] = [
+    { urls: "stun:stun.l.google.com:19302" },
+  ];
+  const turnUrl = import.meta.env.VITE_TURN_URL;
+  const turnUser = import.meta.env.VITE_TURN_USER;
+  const turnCred = import.meta.env.VITE_TURN_CRED;
+  if (turnUrl && turnUser && turnCred) {
+    servers.push({ urls: turnUrl, username: turnUser, credential: turnCred });
+  }
+  return servers;
+}
+const ICE_SERVERS = buildIceServers();
 
 type PeerState = {
   pc: RTCPeerConnection;
@@ -72,11 +75,10 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
 
   const removePeer = useCallback((peerId: string) => {
     const state = peersRef.current.get(peerId);
-    if (state) {
-      state.dataChannel?.close();
-      state.pc.close();
-      peersRef.current.delete(peerId);
-    }
+    if (!state) return; // already cleaned up (presence vs onconnectionstatechange race)
+    state.dataChannel?.close();
+    state.pc.close();
+    peersRef.current.delete(peerId);
     setPeers((curr) => curr.filter((id) => id !== peerId));
     setRemoteStreams((curr) => {
       if (!(peerId in curr)) return curr;
@@ -89,18 +91,19 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
   const attachDataChannel = useCallback(
     (peerId: string, dc: RTCDataChannel) => {
       const state = peersRef.current.get(peerId);
-      if (state) state.dataChannel = dc;
+      // Don't overwrite an already-attached channel: both sides may try in a
+      // simultaneous-open race. First one wins.
+      if (state && !state.dataChannel) state.dataChannel = dc;
       dc.onmessage = (e) => {
+        if (typeof e.data !== "string" || e.data.length > MAX_CHAT_BYTES) return;
         try {
-          const msg = JSON.parse(e.data) as { text: string; ts: number };
+          const raw = JSON.parse(e.data) as { text?: unknown; ts?: unknown };
+          const { text, ts } = raw;
+          if (typeof text !== "string" || typeof ts !== "number") return;
+          const safeText = text.slice(0, 2000);
           setMessages((m) => [
             ...m,
-            {
-              id: `${peerId}-${msg.ts}`,
-              from: peerId,
-              text: msg.text,
-              ts: msg.ts,
-            },
+            { id: `${peerId}-${ts}`, from: peerId, text: safeText, ts },
           ]);
         } catch {
           // ignore malformed
@@ -157,7 +160,9 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
       };
 
       pc.onicecandidate = ({ candidate }) => {
-        sendSignal(peerId, { candidate });
+        // Skip end-of-candidates marker (null). Trickle real candidates only.
+        if (!candidate) return;
+        sendSignal(peerId, { candidate: candidate.toJSON() });
       };
 
       pc.ontrack = ({ streams: [stream] }) => {
@@ -465,24 +470,33 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
       setScreenSharing(false);
       return;
     }
-    const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
-    const track = display.getVideoTracks()[0];
-    screenTrackRef.current = track;
-    replaceVideoTrackOnPeers(track);
-    track.onended = () => {
-      const camTrack = camTrackRef.current;
-      if (camTrack) replaceVideoTrackOnPeers(camTrack);
+    try {
+      const display = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const track = display.getVideoTracks()[0];
+      if (!track) throw new Error("no video track from getDisplayMedia");
+      screenTrackRef.current = track;
+      replaceVideoTrackOnPeers(track);
+      track.onended = () => {
+        const camTrack = camTrackRef.current;
+        if (camTrack) replaceVideoTrackOnPeers(camTrack);
+        screenTrackRef.current = null;
+        setScreenSharing(false);
+      };
+      setScreenSharing(true);
+    } catch (err) {
+      // User denied prompt or no source picked. Stay in cam mode.
+      console.warn("[toggleScreenShare]", err);
+      screenTrackRef.current?.stop();
       screenTrackRef.current = null;
       setScreenSharing(false);
-    };
-    setScreenSharing(true);
+    }
   }, [replaceVideoTrackOnPeers, screenSharing]);
 
   // ---- chat send (DC fast path + DB durable) ----------------------------
 
   const sendChat = useCallback(
     async (text: string) => {
-      const trimmed = text.trim();
+      const trimmed = text.trim().slice(0, 2000);
       if (!trimmed || !userId || !roomId) return;
       const ts = Date.now();
       const tempId = `${userId}-${ts}`;
@@ -490,13 +504,15 @@ export function useWebRTC({ userId }: UseWebRTCArgs): UseWebRTCReturn {
       // 1. optimistic local
       setMessages((m) => [...m, { id: tempId, from: userId, text: trimmed, ts }]);
 
-      // 2. DataChannel push to online peers
+      // 2. DataChannel push to online peers (cap payload size as defense)
       const dcPayload = JSON.stringify({ text: trimmed, ts });
-      peersRef.current.forEach((state) => {
-        if (state.dataChannel?.readyState === "open") {
-          state.dataChannel.send(dcPayload);
-        }
-      });
+      if (dcPayload.length <= MAX_CHAT_BYTES) {
+        peersRef.current.forEach((state) => {
+          if (state.dataChannel?.readyState === "open") {
+            state.dataChannel.send(dcPayload);
+          }
+        });
+      }
 
       // 3. DB persist (also triggers postgres_changes for offline peers)
       const { error } = await supabase
