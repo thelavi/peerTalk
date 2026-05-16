@@ -4,7 +4,7 @@ Multi-peer WebRTC video chat with auth, persistent rooms, and durable text chat 
 
 > **Stack:** React 19 · TypeScript · Vite · Supabase (Postgres + Auth + Realtime) · WebRTC · Vercel
 
-🔗 **Live demo:** https://peertalk.vercel.app *(deploy in progress)*
+🔗 **Live demo:** https://peer-talk-six.vercel.app
 📂 **Repo:** https://github.com/thelavi/peerTalk
 
 ---
