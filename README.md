@@ -217,7 +217,7 @@ Thresholds are enforced in `vitest.config.ts` — coverage regressions fail the 
 I'm Lavi — frontend engineer. peerTalk is one of my self-directed projects to keep WebRTC, signaling, and Postgres modelling fresh.
 
 - GitHub: [@thelavi](https://github.com/thelavi)
-- LinkedIn: [`lavi-sharma`](https://www.linkedin.com/in/lavi-sharma/) *(update before sending)*
+- LinkedIn: [`sharmalavi`](https://www.linkedin.com/in/sharmalavi/)
 
 If you want to chat about the code or a role, please reach out.
 
