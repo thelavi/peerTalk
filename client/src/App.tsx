@@ -45,15 +45,16 @@ const Shell: React.FC = () => {
   } = useWebRTC({ userId });
   const { rooms, createRoom, joinRoomMembership, refresh } = useRooms(userId);
 
-  const localRef = useRef<HTMLVideoElement>(null);
   const [newSlug, setNewSlug] = useState("");
   const [newName, setNewName] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (localRef.current && localStream) localRef.current.srcObject = localStream;
-  }, [localStream]);
+  const attachLocal = (el: HTMLVideoElement | null) => {
+    if (el && localStream && el.srcObject !== localStream) {
+      el.srcObject = localStream;
+    }
+  };
 
   const inCall = Boolean(roomId);
 
@@ -156,7 +157,7 @@ const Shell: React.FC = () => {
         <section className="call">
           <div className="grid">
             <div className="tile tile--self">
-              <video ref={localRef} autoPlay playsInline muted>
+              <video ref={attachLocal} autoPlay playsInline muted>
                 <track kind="captions" />
               </video>
               <span className="tile__label">you</span>
